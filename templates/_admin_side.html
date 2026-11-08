@@ -1,0 +1,2 @@
+<aside class="admin-side"><div class="eyebrow">CONTROL CENTRE</div><h2>Stark<span class="gold">OS.</span></h2>
+{% for ep,label in [('admin','◈ Overview'),('admin_products','▦ Products'),('admin_orders','▤ Orders'),('admin_payments','💳 Payment settings'),('admin_reviews','☆ Reviews'),('analytics','⌁ Analytics'),('home','↗ View store')] %}<a {% if ep==active %}class="active"{% endif %} href="{{url_for(ep)}}">{{label}}{% if badges.get(ep) %}<i>{{badges.get(ep)}}</i>{% endif %}</a>{% endfor %}</aside>
