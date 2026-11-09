@@ -97,3 +97,9 @@ Notes
 ## Speed on Vercel
 - Put the **Vercel Function Region and the Neon database in the same region** (Vercel: *Settings → Functions → Function Region*; Neon region is shown in *Storage → your database*). Different regions make every database query slow.
 - The app re-uses database connections, writes at most one visit per visitor per day, and caches settings for 30 seconds.
+
+## Mobile & speed (latest)
+- Default theme is now **light** (dark is still one tap away). Phones and weak devices automatically get a lighter look (`html.lite`): fewer shapes, no heavy blur/shadow effects. If the 3D background runs slowly it switches itself off.
+- CSS and JS are combined into `public/static/site.css` and `site.js`. **After editing `style.css`, `upgrade.css`, `stark.css`, `app.js` or `stark.js`, run `python build_assets.py`** and commit the new `site.*` files.
+- Static files are cached for a year (`vercel.json`); URLs carry a version so updates still reach visitors.
+- Cloudinary pictures are requested at the size needed (small for cards, larger on the product page); video thumbnails use a still image.

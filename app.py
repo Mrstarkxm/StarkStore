@@ -232,15 +232,37 @@ def ensure_ready():
             app.logger.exception("database init failed")
             return ("Database is not ready: " + str(e)[:200], 503)
 
-def media_src(name):
-    """Public URL of a product image/video: Cloudinary URL as-is (optimised), or a local upload."""
+def media_src(name, w=1200):
+    """Public URL of a product image/video. Cloudinary images are resized (w = max width) and optimised."""
     if not name: return ""
     if name.startswith("https://"):
         if "res.cloudinary.com" in name:
-            name = name.replace("/image/upload/", "/image/upload/f_auto,q_auto/", 1).replace("/video/upload/", "/video/upload/q_auto/", 1)
+            name = name.replace("/image/upload/", f"/image/upload/f_auto,q_auto,c_limit,w_{w}/", 1).replace("/video/upload/", "/video/upload/q_auto/", 1)
         return name
     return url_for("static", filename="uploads/" + name)
-app.jinja_env.globals["media_src"] = media_src
+
+def media_poster(name, w=160):
+    """Small still image for a Cloudinary video (so thumbnails do not download the video)."""
+    if name.startswith("https://res.cloudinary.com") and "/video/upload/" in name:
+        return re.sub(r"\.\w+$", ".jpg", name.replace("/video/upload/", f"/video/upload/so_0,f_jpg,q_auto,c_fill,w_{w},h_{w}/", 1))
+    return ""
+
+def _asset_version():
+    v = (os.environ.get("VERCEL_GIT_COMMIT_SHA") or os.environ.get("VERCEL_DEPLOYMENT_ID") or "")[:12]
+    if v: return v
+    h = hashlib.md5()
+    for f in ("site.css", "site.js", "chat.js"):
+        try:
+            with open(os.path.join(app.static_folder, f), "rb") as fh: h.update(fh.read())
+        except OSError: pass
+    return h.hexdigest()[:10]
+ASSET_V = _asset_version()
+
+def asset(filename):
+    """Static file URL with a version, so browsers can cache it for a long time."""
+    return url_for("static", filename=filename, v=ASSET_V)
+
+app.jinja_env.globals.update(media_src=media_src, media_poster=media_poster, asset=asset)
 
 def admin_required(fn):
     @wraps(fn)

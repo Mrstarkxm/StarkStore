@@ -4,7 +4,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const toggle = document.getElementById("themeToggle");
   const savedTheme = localStorage.getItem("stark-theme");
   const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
-  const initialTheme = savedTheme || "dark";
+  const initialTheme = savedTheme || "light";
 
   function setTheme(theme) {
     root.dataset.theme = theme;
