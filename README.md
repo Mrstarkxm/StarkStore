@@ -68,3 +68,28 @@ Do not mark an order Paid until funds are confirmed. For live card payments, con
 - Admin → Products: select several images and videos at once (add more in several rounds, remove with ×). Images up to 8 MB, videos (MP4/WEBM/MOV) up to 100 MB each, max 12 files per upload.
 - Edit product: see all files, make any image the cover, remove files, add more.
 - Product page: gallery with thumbnails, arrows, swipe/keyboard and an inline video player. Older single product images are migrated automatically.
+
+# Deploy on Vercel
+
+Vercel functions have a read-only, temporary disk, so this version stores data outside the server:
+**Postgres** (orders, products, users, chat, payment screenshots) and **Cloudinary** (product images & videos).
+Running locally still works exactly as before (SQLite + local files) when no `DATABASE_URL` is set.
+
+1. Push the project to GitHub and import it in Vercel (Framework: Flask is detected from `app.py`).
+2. **Database:** Vercel dashboard → *Storage* → create a **Neon Postgres** database and connect it to the project. This adds `DATABASE_URL` / `POSTGRES_URL` automatically.
+3. **Cloudinary (free):** create an account → *Settings → Upload → Upload presets → Add preset* → set **Signing mode: Unsigned**. Note your *Cloud name* and the preset name.
+4. In Vercel → *Settings → Environment Variables* add:
+   | Name | Value |
+   |---|---|
+   | `SECRET_KEY` | a long random string |
+   | `ADMIN_EMAIL` | your admin login email |
+   | `ADMIN_PASSWORD` | a strong password (used once, when the admin account is first created) |
+   | `CLOUDINARY_CLOUD_NAME` | your cloud name |
+   | `CLOUDINARY_UPLOAD_PRESET` | your unsigned preset name |
+5. Deploy. Open `/login` with the admin email/password, then set up **Payment settings** and add products.
+
+Notes
+- Product images/videos upload straight from the browser to Cloudinary (no size problems with Vercel's 4.5 MB request limit). Images up to 8 MB, videos up to 100 MB.
+- Payment screenshots in the order chat are stored in the database and are shrunk in the browser before upload (Vercel allows about 4.5 MB per request).
+- Removing a file in the admin panel removes it from the product; the original stays in your Cloudinary library.
+- The loading screen was removed, so pages no longer show it on every click.

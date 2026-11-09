@@ -1,23 +1,112 @@
-import os, sqlite3, secrets
+import os, re, json, hashlib, sqlite3, secrets
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from datetime import datetime, date
 from functools import wraps
-from flask import Flask, jsonify, send_from_directory, render_template, request, redirect, url_for, session, flash, g, abort
+from flask import Flask, Response, jsonify, send_from_directory, render_template, request, redirect, url_for, session, flash, g, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-before-deploying-" + secrets.token_hex(16))
-app.config["MAX_CONTENT_LENGTH"] = 400 * 1024 * 1024  # product videos; per-file limits are enforced below
-app.config["UPLOAD_FOLDER"] = os.path.join(app.root_path, "static", "uploads")
+# ---------- environment ----------
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+
+def _clean_db_url(url):
+    if url.startswith("postgres://"): url = "postgresql://" + url[len("postgres://"):]
+    parts = urlsplit(url)
+    q = [(k, v) for k, v in parse_qsl(parts.query) if k != "supa"]  # extra param psycopg rejects
+    return urlunsplit(parts._replace(query=urlencode(q)))
+
+DATABASE_URL = _clean_db_url(os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or "")
+USE_PG = bool(DATABASE_URL)
+if USE_PG:
+    import psycopg
+    from psycopg.types.numeric import FloatLoader
+    psycopg.adapters.register_loader("numeric", FloatLoader)
+    DB_INTEGRITY = (sqlite3.IntegrityError, psycopg.errors.IntegrityError)
+else:
+    DB_INTEGRITY = (sqlite3.IntegrityError,)
+
+CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+CLOUD_PRESET = os.environ.get("CLOUDINARY_UPLOAD_PRESET", "").strip()
+CLOUD = {"name": CLOUD_NAME, "preset": CLOUD_PRESET} if CLOUD_NAME and CLOUD_PRESET else None
+
+app = Flask(__name__, static_folder="public/static", static_url_path="/static")
+_secret = os.environ.get("SECRET_KEY")
+if not _secret:
+    _secret = hashlib.sha256(("stark-store|" + DATABASE_URL).encode()).hexdigest() if DATABASE_URL else "change-this-secret-before-deploying-" + secrets.token_hex(16)
+app.secret_key = _secret
+app.config.update(MAX_CONTENT_LENGTH=400 * 1024 * 1024, SESSION_COOKIE_SECURE=ON_VERCEL, SESSION_COOKIE_SAMESITE="Lax")
+app.config["UPLOAD_FOLDER"] = "/tmp/uploads" if ON_VERCEL else os.path.join(app.root_path, "public", "static", "uploads")
 DB = os.path.join(app.root_path, "stark_store.db")
-os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+try: os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+except OSError: pass
 ALLOWED = {"png", "jpg", "jpeg", "webp", "gif"}
+
+# ---------- database layer: SQLite locally, Postgres (Neon / Vercel Postgres) when DATABASE_URL is set ----------
+class PgRow:
+    __slots__ = ("_names", "_values", "_map")
+    def __init__(self, names, values): self._names, self._values, self._map = names, tuple(values), dict(zip(names, values))
+    def __getitem__(self, k): return self._values[k] if isinstance(k, (int, slice)) else self._map[k]
+    def keys(self): return list(self._names)
+    def get(self, k, d=None): return self._map.get(k, d)
+    def __iter__(self): return iter(self._values)
+    def __len__(self): return len(self._values)
+
+def _pg_row_factory(cursor):
+    names = [c.name for c in (cursor.description or [])]
+    return lambda values: PgRow(names, values)
+
+_ID_TABLES = {"users", "products", "orders", "order_items", "reviews", "visits", "product_media", "order_messages"}
+
+def pg_sql(sql):
+    """Translate the app's SQLite-flavoured SQL to Postgres. Returns (sql, wants_returning_id)."""
+    s = sql.replace("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value")
+    s = re.sub(r"\bLIKE\b", "ILIKE", s)
+    s = s.replace("%", "%%").replace("?", "%s")
+    m = re.match(r"\s*INSERT\s+INTO\s+(\w+)", s, re.I)
+    want = bool(m and m.group(1).lower() in _ID_TABLES and "ON CONFLICT" not in s.upper())
+    if want: s = s.rstrip().rstrip(";") + " RETURNING id"
+    return s, want
+
+def pg_ddl(sql):
+    s = re.sub(r"\bINTEGER PRIMARY KEY\b", "SERIAL PRIMARY KEY", sql)
+    s = re.sub(r"\bREAL\b", "DOUBLE PRECISION", s)
+    return re.sub(r"\bBLOB\b", "BYTEA", s)
+
+class PgCursor:
+    def __init__(self, cur, lastrowid=None): self._c, self.lastrowid, self.rowcount = cur, lastrowid, cur.rowcount
+    def fetchone(self): return self._c.fetchone() if self._c.description else None
+    def fetchall(self): return self._c.fetchall() if self._c.description else []
+    def __iter__(self): return iter(self.fetchall())
+
+class PgConn:
+    def __init__(self): self.conn = psycopg.connect(DATABASE_URL, row_factory=_pg_row_factory, prepare_threshold=None)
+    def execute(self, sql, params=()):
+        s, want = pg_sql(sql)
+        try: cur = self.conn.execute(s, tuple(params))
+        except Exception:
+            self.conn.rollback(); raise
+        last = None
+        if want:
+            r = cur.fetchone(); last = r[0] if r else None
+        return PgCursor(cur, last)
+    def executescript(self, script):
+        for stmt in script.split(";"):
+            if stmt.strip(): self.conn.execute(pg_ddl(stmt))
+    def commit(self): self.conn.commit()
+    def close(self): self.conn.close()
+
+def raw_conn():
+    if USE_PG: return PgConn()
+    c = sqlite3.connect(DB); c.execute("PRAGMA foreign_keys=ON"); return c
 
 def db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys=ON")
+        if USE_PG: g.db = PgConn()
+        else:
+            g.db = sqlite3.connect(DB)
+            g.db.row_factory = sqlite3.Row
+            g.db.execute("PRAGMA foreign_keys=ON")
     return g.db
 
 @app.teardown_appcontext
@@ -25,10 +114,7 @@ def close_db(_):
     conn = g.pop("db", None)
     if conn: conn.close()
 
-def init_db():
-    with sqlite3.connect(DB) as c:
-        c.execute("PRAGMA foreign_keys=ON")
-        c.executescript("""
+SCHEMA = """
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'customer', created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT DEFAULT 'General', description TEXT DEFAULT '', price REAL NOT NULL, discount REAL DEFAULT 0, stock INTEGER DEFAULT 0, image TEXT DEFAULT '', active INTEGER DEFAULT 1, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, user_id INTEGER, customer_name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, address TEXT NOT NULL, total REAL NOT NULL, status TEXT DEFAULT 'Pending', created_at TEXT NOT NULL, payment_method TEXT DEFAULT 'Cash on Delivery', payment_status TEXT DEFAULT 'Unpaid', payment_reference TEXT DEFAULT '', FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL);
@@ -38,27 +124,69 @@ def init_db():
         CREATE TABLE IF NOT EXISTS product_media(id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, filename TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'image', FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS order_messages(id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, sender TEXT NOT NULL, body TEXT DEFAULT '', image TEXT DEFAULT '', extra TEXT DEFAULT '', created_at TEXT NOT NULL, FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE);
-        """)
-        order_columns = {row[1] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
-        for column, definition in {
-            "payment_method": "TEXT DEFAULT 'Cash on Delivery'",
-            "payment_status": "TEXT DEFAULT 'Unpaid'",
-            "payment_reference": "TEXT DEFAULT ''",
-            "address_confirmed": "INTEGER DEFAULT 0",
-            "chat_state": "TEXT DEFAULT 'done'",
-            "payment_screenshot": "TEXT DEFAULT ''",
-            "customer_unread": "INTEGER DEFAULT 0",
-            "agent_unread": "INTEGER DEFAULT 0",
-        }.items():
-            if column not in order_columns:
-                c.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
+        CREATE TABLE IF NOT EXISTS chat_files(name TEXT PRIMARY KEY, mime TEXT NOT NULL DEFAULT 'image/jpeg', data BLOB NOT NULL);
+        """
+
+ORDER_COLUMNS = {
+    "payment_method": "TEXT DEFAULT 'Cash on Delivery'", "payment_status": "TEXT DEFAULT 'Unpaid'", "payment_reference": "TEXT DEFAULT ''",
+    "address_confirmed": "INTEGER DEFAULT 0", "chat_state": "TEXT DEFAULT 'done'", "payment_screenshot": "TEXT DEFAULT ''",
+    "customer_unread": "INTEGER DEFAULT 0", "agent_unread": "INTEGER DEFAULT 0",
+}
+
+def init_db():
+    c = raw_conn()
+    try:
+        c.executescript(SCHEMA)
+        if USE_PG:
+            for column, definition in ORDER_COLUMNS.items():
+                c.execute(f"ALTER TABLE orders ADD COLUMN IF NOT EXISTS {column} {definition}")
+        else:
+            have = {row[1] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
+            for column, definition in ORDER_COLUMNS.items():
+                if column not in have: c.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
         admin_email = os.environ.get("ADMIN_EMAIL", "admin@starkstore.local")
-        admin_password = os.environ.get("ADMIN_PASSWORD", "ChangeMe123!")
+        admin_password = os.environ.get("ADMIN_PASSWORD") or (None if ON_VERCEL else "ChangeMe123!")
         exists = c.execute("SELECT id FROM users WHERE role='admin'").fetchone()
-        if not exists:
+        if not exists and admin_password:
             c.execute("INSERT INTO users(name,email,password,role,created_at) VALUES(?,?,?,?,?)",
                       ("Stark Store Admin", admin_email.lower(), generate_password_hash(admin_password), "admin", datetime.now().isoformat(timespec="seconds")))
+        elif not exists:
+            print("WARNING: no admin account created. Set ADMIN_EMAIL and ADMIN_PASSWORD environment variables.")
         c.commit()
+    finally:
+        c.close()
+
+def migrate_media():
+    c = raw_conn()
+    try:
+        c.execute("INSERT INTO product_media(product_id,filename,kind) SELECT id,image,'image' FROM products WHERE image IS NOT NULL AND image!='' AND id NOT IN (SELECT product_id FROM product_media)")
+        c.commit()
+    finally:
+        c.close()
+
+_ready = False
+@app.before_request
+def ensure_ready():
+    global _ready
+    if request.endpoint == "static": return
+    if ON_VERCEL and not USE_PG:
+        return ("Stark Store is not configured yet: add a Postgres database (DATABASE_URL) to your Vercel project, then redeploy.", 503)
+    if not _ready:
+        try:
+            init_db(); migrate_media(); _ready = True
+        except Exception as e:
+            app.logger.exception("database init failed")
+            return ("Database is not ready: " + str(e)[:200], 503)
+
+def media_src(name):
+    """Public URL of a product image/video: Cloudinary URL as-is (optimised), or a local upload."""
+    if not name: return ""
+    if name.startswith("https://"):
+        if "res.cloudinary.com" in name:
+            name = name.replace("/image/upload/", "/image/upload/f_auto,q_auto/", 1).replace("/video/upload/", "/video/upload/q_auto/", 1)
+        return name
+    return url_for("static", filename="uploads/" + name)
+app.jinja_env.globals["media_src"] = media_src
 
 def admin_required(fn):
     @wraps(fn)
@@ -86,7 +214,7 @@ def inject():
         ids = session.get("my_orders", [])
         if ids: conds.append("id IN (%s)" % ",".join("?" * len(ids))); args += ids
         if conds: my_unread = db().execute("SELECT COUNT(*) FROM orders WHERE customer_unread=1 AND (" + " OR ".join(conds) + ")", args).fetchone()[0]
-    return {"current_user": u, "cart_count": sum(session.get("cart", {}).values()), "badges": badges, "my_unread": my_unread, "status_label": STATUS_LABEL}
+    return {"current_user": u, "cart_count": sum(session.get("cart", {}).values()), "badges": badges, "my_unread": my_unread, "status_label": STATUS_LABEL, "cloud": CLOUD, "on_vercel": ON_VERCEL}
 
 @app.before_request
 def count_visit():
@@ -116,8 +244,9 @@ _b, _e, _j = (os.environ.get(k, "") for k in ("STARK_BANK_DETAILS", "STARK_EASYP
 SETTING_DEFAULTS = {"pay_cod": "1", "pay_bank": "1" if _b else "0", "pay_easypaisa": "1" if _e else "0", "pay_jazzcash": "1" if _j else "0", "pay_card": "0",
                     "bank_name": "", "bank_title": "", "bank_number": _b, "ep_title": "", "ep_number": _e, "jc_title": "", "jc_number": _j,
                     "card_info": "", "support_name": "Stark Support"}
-CHAT_DIR = os.path.join(app.root_path, "private_uploads")
-os.makedirs(CHAT_DIR, exist_ok=True)
+CHAT_DIR = "/tmp/private_uploads" if ON_VERCEL else os.path.join(app.root_path, "private_uploads")
+try: os.makedirs(CHAT_DIR, exist_ok=True)
+except OSError: pass
 STATUS_MSG = {"Confirmed": "✅ Good news! Your order #{id} has been confirmed by our team.",
               "Shipped": "🚚 Your order #{id} is on its way! It will reach you soon.",
               "Delivered": "📦 Your order #{id} has been delivered. Thank you for shopping with Stark Store! 💜",
@@ -214,6 +343,8 @@ def bot_reply(conn, o, text, action, image):
             if not last or "agent will reply" not in last["body"]:
                 add_msg(conn, oid, "bot", "Thanks! Our agent will reply here soon. 🙏")
 
+MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}
+
 def save_chat_image(f):
     if not f or not f.filename: return ""
     ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
@@ -223,7 +354,8 @@ def save_chat_image(f):
     if size > 8 * 1024 * 1024: raise ValueError("Image is too large (max 8 MB).")
     if ext not in ALLOWED or not ok: raise ValueError("Please attach a JPG, PNG, WEBP or GIF image.")
     name = secrets.token_hex(16) + "." + ext
-    f.save(os.path.join(CHAT_DIR, name))
+    if USE_PG: db().execute("INSERT INTO chat_files(name,mime,data) VALUES(?,?,?)", (name, MIME[ext], f.stream.read()))
+    else: f.save(os.path.join(CHAT_DIR, name))
     return name
 
 def msg_json(oid, r):
@@ -418,6 +550,10 @@ def chat_file(oid, name):
     o = db().execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
     if not can_access(o): abort(404)
     if not db().execute("SELECT 1 FROM order_messages WHERE order_id=? AND image=?", (oid, name)).fetchone(): abort(404)
+    if USE_PG:
+        row = db().execute("SELECT mime,data FROM chat_files WHERE name=?", (name,)).fetchone()
+        if not row: abort(404)
+        return Response(bytes(row["data"]), mimetype=row["mime"], headers={"Cache-Control": "private, max-age=86400"})
     return send_from_directory(CHAT_DIR, name)
 
 @app.route("/register", methods=["GET","POST"])
@@ -431,7 +567,7 @@ def register():
                 cur=db().execute("INSERT INTO users(name,email,password,role,created_at) VALUES(?,?,?,?,?)",(name,email,generate_password_hash(password),"customer",datetime.now().isoformat(timespec="seconds")))
                 db().commit(); session.update(user_id=cur.lastrowid, role="customer")
                 flash("Welcome to Stark Store!", "success"); return redirect(url_for("home"))
-            except sqlite3.IntegrityError: flash("That email is already registered.", "error")
+            except DB_INTEGRITY: flash("That email is already registered.", "error")
     return render_template("auth.html", mode="register")
 
 @app.route("/login", methods=["GET","POST"])
@@ -489,10 +625,27 @@ def save_media(f):
     return name, kind
 
 def drop_file(name):
+    if name.startswith("http"): return  # remote (Cloudinary) file: nothing on disk
     try: os.remove(os.path.join(app.config["UPLOAD_FOLDER"], name))
     except OSError: pass
 
+def cloud_media_from_form():
+    """Files the browser already uploaded straight to Cloudinary (JSON list of urls)."""
+    raw = request.form.get("media_urls", "").strip()
+    if not raw: return []
+    try: items = json.loads(raw)
+    except ValueError: raise MediaError("The upload data was invalid. Please try again.")
+    prefix = f"https://res.cloudinary.com/{CLOUD_NAME}/"
+    out = []
+    for it in (items if isinstance(items, list) else [])[:12]:
+        url = str(it.get("url", "")) if isinstance(it, dict) else ""
+        if not CLOUD_NAME or not url.startswith(prefix): raise MediaError("Invalid media URL.")
+        out.append((url, "video" if "/video/upload/" in url else "image"))
+    return out
+
 def save_media_files(files):
+    if ON_VERCEL and any(f and f.filename for f in files):
+        raise MediaError("On Vercel, product images and videos are uploaded through Cloudinary (see the README setup).")
     out = []
     try:
         for f in files[:12]:
@@ -512,7 +665,7 @@ def product_media(pid, cover=""):
 def admin_products():
     if request.method=="POST":
         try:
-            media=save_media_files(request.files.getlist("media"))
+            media=cloud_media_from_form()+save_media_files(request.files.getlist("media"))
             image=next((n for n,k in media if k=="image"),"")
             cur=db().execute("INSERT INTO products(name,category,description,price,discount,stock,image,created_at) VALUES(?,?,?,?,?,?,?,?)",
               (request.form["name"].strip(),request.form.get("category","General").strip(),request.form.get("description","").strip(),
@@ -533,7 +686,7 @@ def edit_product(pid):
     if not p: abort(404)
     if request.method=="POST":
         try:
-            media=save_media_files(request.files.getlist("media"))
+            media=cloud_media_from_form()+save_media_files(request.files.getlist("media"))
             image=p["image"] or next((n for n,k in media if k=="image"),"")
             for n,k in media: db().execute("INSERT INTO product_media(product_id,filename,kind) VALUES(?,?,?)",(pid,n,k))
             db().execute("UPDATE products SET name=?,category=?,description=?,price=?,discount=?,stock=?,image=?,active=? WHERE id=?",
@@ -675,11 +828,6 @@ def analytics():
 @app.errorhandler(413)
 def too_large(_): return "Upload is too large. Images: max 8 MB each, videos: max 100 MB each.", 413
 
-def migrate_media():
-    c = sqlite3.connect(DB)
-    c.execute("INSERT INTO product_media(product_id,filename,kind) SELECT id,image,'image' FROM products WHERE image IS NOT NULL AND image!='' AND id NOT IN (SELECT product_id FROM product_media)")
-    c.commit(); c.close()
-
-init_db(); migrate_media()
 if __name__ == "__main__":
+    init_db(); migrate_media()
     app.run(debug=os.environ.get("FLASK_DEBUG")=="1", host="127.0.0.1", port=int(os.environ.get("PORT",5000)))
