@@ -10,7 +10,7 @@ $$('.flash').forEach(f=>{toast(f.textContent);f.remove()});
 // cursor glow
 const cg=$('#cursorGlow');if(matchMedia('(pointer:fine)').matches)addEventListener('pointermove',e=>{cg.style.left=e.clientX+'px';cg.style.top=e.clientY+'px'});
 // 3D scene: floating polyhedra + rings + depth dust; reacts to mouse, scroll and click
-const cv=$('#stars'),cx=cv.getContext('2d'),root=document.documentElement;let W,H,R=1;
+const cv=$('#stars'),cx=cv.getContext('2d'),root=document.documentElement;let W,H,R=1;const LOW=(navigator.hardwareConcurrency||8)<=4||(navigator.deviceMemory||8)<=4||innerWidth<700;
 const G={cube:{v:[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]],f:[[0,1,2,3],[4,5,6,7],[0,1,5,4],[2,3,7,6],[1,2,6,5],[0,3,7,4]]},
  oct:{v:[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]],f:[[0,2,4],[2,1,4],[1,3,4],[3,0,4],[2,0,5],[1,2,5],[3,1,5],[0,3,5]]},
  tet:{v:[[1,1,1],[-1,-1,1],[-1,1,-1],[1,-1,-1]],f:[[0,1,2],[0,3,1],[0,2,3],[1,3,2]]},
@@ -18,10 +18,10 @@ const G={cube:{v:[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,
 const PAL={dark:[[192,132,252],[236,72,153],[129,140,248],[244,114,182]],light:[[124,58,237],[219,39,119],[59,130,246],[168,85,247]]};
 let sh=[],dust=[],M={x:0,y:0,sx:0,sy:0,px:-999,py:-999},SC=0,pulse=0;
 const rnd=(a,b)=>a+Math.random()*(b-a);
-function build(){W=innerWidth;H=innerHeight;R=Math.min(devicePixelRatio||1,1.5);cv.width=W*R;cv.height=H*R;cv.style.width=W+'px';cv.style.height=H+'px';
- const n=W<700?9:16,kinds=['cube','oct','tet','cube','oct','ring'];
+function build(){W=innerWidth;H=innerHeight;R=LOW?1:Math.min(devicePixelRatio||1,1.5);cv.width=W*R;cv.height=H*R;cv.style.width=W+'px';cv.style.height=H+'px';
+ const n=LOW?8:16,kinds=['cube','oct','tet','cube','oct','ring'];
  sh=Array.from({length:n},(_,i)=>({g:G[kinds[i%kinds.length]],x:rnd(-.6,.6)*W,y:rnd(-.7,.7)*H,z:rnd(80,900),s:rnd(26,70),rx:rnd(0,6),ry:rnd(0,6),vx:rnd(-.012,.012),vy:rnd(-.015,.015),c:i%4,ox:0,oy:0}));
- dust=Array.from({length:W<700?60:130},()=>({x:rnd(-.7,.7)*W,y:rnd(-.7,.7)*H,z:rnd(0,1100),c:Math.floor(rnd(0,4))}))}
+ dust=Array.from({length:LOW?45:130},()=>({x:rnd(-.7,.7)*W,y:rnd(-.7,.7)*H,z:rnd(0,1100),c:Math.floor(rnd(0,4))}))}
 build();addEventListener('resize',build);
 addEventListener('pointermove',e=>{M.x=e.clientX/W-.5;M.y=e.clientY/H-.5;M.px=e.clientX;M.py=e.clientY},{passive:true});
 addEventListener('pointerdown',e=>{pulse=1;M.px=e.clientX;M.py=e.clientY});
@@ -38,10 +38,10 @@ function frame(){M.sx+=(M.x-M.sx)*.06;M.sy+=(M.y-M.sy)*.06;const light=root.data
   const dx=p[0]+o.ox-M.px,dy=p[1]+o.oy-M.py,d=Math.hypot(dx,dy)||1,rad=pulse?340:170;if(d<rad){const f=(1-d/rad)*(pulse?26:5);o.ox+=dx/d*f;o.oy+=dy/d*f;o.vy+=.0008*(dx>0?1:-1)}
   o.ox*=.93;o.oy*=.93;o.vy*=.995;return{o,p,sy,yy}}).sort((u,v)=>v.p[3]-u.p[3]);pulse=0;
  for(const{o,p,sy,yy}of items){const c=P[o.c],k=p[2],g=o.g,pts=g.v.map(v=>{const r=rot(v,o.rx,o.ry);return proj(o.x+r[0]*o.s,yy+r[1]*o.s,o.z+r[2]*o.s,a,b,sy)}).map(q=>[q[0]+o.ox,q[1]+o.oy,q[3]]);
-  cx.lineJoin='round';cx.shadowColor=`rgba(${c},.8)`;cx.shadowBlur=light?6:14;cx.strokeStyle=`rgba(${c},${light?.85:.8})`;cx.lineWidth=Math.max(1,2.2*k);
+  cx.lineJoin='round';cx.shadowColor=`rgba(${c},.8)`;cx.shadowBlur=LOW?0:light?6:14;cx.strokeStyle=`rgba(${c},${light?.85:.8})`;cx.lineWidth=Math.max(1,2.2*k);
   if(g.ring){cx.beginPath();pts.forEach((q,i)=>i?cx.lineTo(q[0],q[1]):cx.moveTo(q[0],q[1]));cx.closePath();cx.stroke();continue}
   [...g.f].sort((u,v)=>u.reduce((s,i)=>s+pts[i][2],0)/u.length<v.reduce((s,i)=>s+pts[i][2],0)/v.length?1:-1).forEach((f,i)=>{cx.beginPath();f.forEach((j,n)=>n?cx.lineTo(pts[j][0],pts[j][1]):cx.moveTo(pts[j][0],pts[j][1]));cx.closePath();cx.fillStyle=`rgba(${c},${(light?.22:.16)+(i%3)*.05})`;cx.fill();cx.stroke()})}
- cx.shadowBlur=0;if(!still)requestAnimationFrame(frame)}
+ cx.shadowBlur=0;if(!still)requestAnimationFrame(LOW?()=>requestAnimationFrame(frame):frame)}
 frame();
 // generic 3D tilt with glare
 if(matchMedia('(pointer:fine)').matches&&!still)$$('.product-card,.detail-image,.auth-card,.promo,.cart-item,.stat-card,.trust div,.review,.empty-state,.success-page').forEach(el=>{el.classList.add('tilt');

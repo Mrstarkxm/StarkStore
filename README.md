@@ -93,3 +93,7 @@ Notes
 - Payment screenshots in the order chat are stored in the database and are shrunk in the browser before upload (Vercel allows about 4.5 MB per request).
 - Removing a file in the admin panel removes it from the product; the original stays in your Cloudinary library.
 - The loading screen was removed, so pages no longer show it on every click.
+
+## Speed on Vercel
+- Put the **Vercel Function Region and the Neon database in the same region** (Vercel: *Settings → Functions → Function Region*; Neon region is shown in *Storage → your database*). Different regions make every database query slow.
+- The app re-uses database connections, writes at most one visit per visitor per day, and caches settings for 30 seconds.

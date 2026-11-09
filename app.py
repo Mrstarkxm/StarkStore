@@ -1,4 +1,4 @@
-import os, re, json, hashlib, sqlite3, secrets
+import os, re, json, time, threading, hashlib, sqlite3, secrets
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from datetime import datetime, date
 from functools import wraps
@@ -79,13 +79,53 @@ class PgCursor:
     def fetchall(self): return self._c.fetchall() if self._c.description else []
     def __iter__(self): return iter(self.fetchall())
 
+_pool, _pool_lock = [], threading.Lock()
+
+def _bad(c): return c.closed or getattr(c, "broken", False)
+
+def _acquire():
+    while True:
+        with _pool_lock: c = _pool.pop() if _pool else None
+        if c is None: return None
+        if not _bad(c): return c
+
+def _release(c):
+    if not _bad(c):
+        with _pool_lock:
+            if len(_pool) < 4: _pool.append(c); return
+    try: c.close()
+    except Exception: pass
+
 class PgConn:
-    def __init__(self): self.conn = psycopg.connect(DATABASE_URL, row_factory=_pg_row_factory, prepare_threshold=None)
+    """Re-uses warm connections between requests and only opens a transaction for writes (fewer round trips)."""
+    def __init__(self):
+        self._used = self._in_tx = False
+        self.conn = _acquire() or self._connect()
+    def _connect(self):
+        return psycopg.connect(DATABASE_URL, row_factory=_pg_row_factory, prepare_threshold=None, autocommit=True)
+    def _run(self, s, params=()):
+        try: return self.conn.execute(s, params)
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            if self._used or self._in_tx: raise
+            try: self.conn.close()      # idle connection was closed by the server: reconnect once
+            except Exception: pass
+            self.conn = self._connect()
+            return self.conn.execute(s, params)
+    def _rollback(self):
+        if self._in_tx:
+            self._in_tx = False
+            try: self.conn.execute("ROLLBACK")
+            except Exception:
+                try: self.conn.close()
+                except Exception: pass
     def execute(self, sql, params=()):
         s, want = pg_sql(sql)
-        try: cur = self.conn.execute(s, tuple(params))
+        try:
+            if not self._in_tx and re.match(r"\s*(INSERT|UPDATE|DELETE)\b", s, re.I):
+                self._run("BEGIN"); self._in_tx = True; self._used = True
+            cur = self._run(s, tuple(params)); self._used = True
         except Exception:
-            self.conn.rollback(); raise
+            self._rollback(); raise
         last = None
         if want:
             r = cur.fetchone(); last = r[0] if r else None
@@ -93,8 +133,11 @@ class PgConn:
     def executescript(self, script):
         for stmt in script.split(";"):
             if stmt.strip(): self.conn.execute(pg_ddl(stmt))
-    def commit(self): self.conn.commit()
-    def close(self): self.conn.close()
+    def commit(self):
+        if self._in_tx:
+            self._in_tx = False; self.conn.execute("COMMIT")
+    def close(self):
+        self._rollback(); _release(self.conn)
 
 def raw_conn():
     if USE_PG: return PgConn()
@@ -133,9 +176,18 @@ ORDER_COLUMNS = {
     "customer_unread": "INTEGER DEFAULT 0", "agent_unread": "INTEGER DEFAULT 0",
 }
 
+def schema_ready(c):
+    try:
+        c.execute("SELECT agent_unread FROM orders LIMIT 1"); c.execute("SELECT 1 FROM chat_files LIMIT 1"); c.execute("SELECT 1 FROM product_media LIMIT 1")
+        return bool(c.execute("SELECT id FROM users WHERE role='admin'").fetchone())
+    except Exception:
+        return False
+
 def init_db():
+    """Creates/updates tables. Returns False (and does nothing) when everything already exists."""
     c = raw_conn()
     try:
+        if schema_ready(c): return False
         c.executescript(SCHEMA)
         if USE_PG:
             for column, definition in ORDER_COLUMNS.items():
@@ -153,6 +205,7 @@ def init_db():
         elif not exists:
             print("WARNING: no admin account created. Set ADMIN_EMAIL and ADMIN_PASSWORD environment variables.")
         c.commit()
+        return True
     finally:
         c.close()
 
@@ -173,7 +226,8 @@ def ensure_ready():
         return ("Stark Store is not configured yet: add a Postgres database (DATABASE_URL) to your Vercel project, then redeploy.", 503)
     if not _ready:
         try:
-            init_db(); migrate_media(); _ready = True
+            _ready = True
+            if init_db(): migrate_media()
         except Exception as e:
             app.logger.exception("database init failed")
             return ("Database is not ready: " + str(e)[:200], 503)
@@ -198,9 +252,9 @@ def admin_required(fn):
     return wrapper
 
 def current_user():
-    if session.get("user_id"):
-        return db().execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
-    return None
+    if not session.get("user_id"): return None
+    if "cu" not in g: g.cu = db().execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    return g.cu
 
 @app.context_processor
 def inject():
@@ -219,8 +273,10 @@ def inject():
 @app.before_request
 def count_visit():
     if request.endpoint and not request.endpoint.startswith(("static", "api_")) and request.endpoint not in ("login", "register", "add_cart", "update_cart", "order_chat_post", "chat_file", "admin_reply"):
-        db().execute("INSERT INTO visits(visited_on) VALUES(?)", (date.today().isoformat(),))
-        db().commit()
+        today = date.today().isoformat()
+        if session.get("visit_day") != today:
+            db().execute("INSERT INTO visits(visited_on) VALUES(?)", (today,))
+            db().commit(); session["visit_day"] = today
 
 def parse_prices(form):
     """Admin enters original (cut) price + sale price; discount % is derived."""
@@ -262,10 +318,14 @@ def now(): return datetime.now().isoformat(timespec="seconds")
 def money(x): return f"Rs. {float(x):,.2f}"
 def is_agent(): return bool(session.get("user_id")) and session.get("role") == "admin"
 
+_settings_cache = {"t": 0.0, "v": None}
+
 def get_settings():
-    st = dict(SETTING_DEFAULTS)
-    for r in db().execute("SELECT key,value FROM settings"): st[r["key"]] = r["value"]
-    return st
+    if _settings_cache["v"] is None or time.time() - _settings_cache["t"] > 30:
+        st = dict(SETTING_DEFAULTS)
+        for r in db().execute("SELECT key,value FROM settings"): st[r["key"]] = r["value"]
+        _settings_cache.update(t=time.time(), v=st)
+    return dict(_settings_cache["v"])
 
 def can_access(o):
     if not o: return False
@@ -539,7 +599,9 @@ def api_order_messages(oid):
     conn = db(); o = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
     if not can_access(o): abort(404)
     agent = is_agent(); after = request.args.get("after", 0, type=int)
-    conn.execute("UPDATE orders SET %s=0 WHERE id=?" % ("agent_unread" if agent else "customer_unread"), (oid,)); conn.commit()
+    col = "agent_unread" if agent else "customer_unread"
+    if o[col]:
+        conn.execute("UPDATE orders SET %s=0 WHERE id=?" % col, (oid,)); conn.commit()
     rows = conn.execute("SELECT * FROM order_messages WHERE order_id=? AND id>? ORDER BY id", (oid, after)).fetchall()
     quick = [] if (agent or o["status"] == "Cancelled") else QUICK.get(o["chat_state"], [])
     return jsonify(messages=[msg_json(oid, r) for r in rows], status=o["status"], status_label=STATUS_LABEL.get(o["status"], o["status"]),
@@ -792,7 +854,7 @@ def admin_payments():
         for k in SETTING_DEFAULTS:
             v = ("1" if request.form.get(k) else "0") if k.startswith("pay_") else request.form.get(k, "").strip()[:500]
             conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, v))
-        conn.commit()
+        conn.commit(); _settings_cache["v"] = None
         f = request.form
         for flag, field, label in (("pay_bank", "bank_number", "Bank Transfer"), ("pay_easypaisa", "ep_number", "Easypaisa"), ("pay_jazzcash", "jc_number", "JazzCash"), ("pay_card", "card_info", "Card / Online")):
             if f.get(flag) and not f.get(field, "").strip(): flash(f"{label} is ON but has no account details yet.", "error")
@@ -829,5 +891,5 @@ def analytics():
 def too_large(_): return "Upload is too large. Images: max 8 MB each, videos: max 100 MB each.", 413
 
 if __name__ == "__main__":
-    init_db(); migrate_media()
+    if init_db(): migrate_media()
     app.run(debug=os.environ.get("FLASK_DEBUG")=="1", host="127.0.0.1", port=int(os.environ.get("PORT",5000)))
