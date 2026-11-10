@@ -1,5 +1,5 @@
 (()=>{const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
-const money=n=>'Rs. '+Number(n).toFixed(2),fetchH={'X-Requested-With':'fetch'};
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),money=n=>'Rs. '+Number(n).toFixed(2),fetchH={'X-Requested-With':'fetch'};
 // scroll progress + back to top
 const bar=$('#progress'),top=$('#toTop');
 addEventListener('scroll',()=>{const h=document.documentElement,p=h.scrollTop/(h.scrollHeight-h.clientHeight||1);bar.style.width=p*100+'%';top.classList.toggle('show',h.scrollTop>500)},{passive:true});
@@ -55,14 +55,14 @@ document.addEventListener('click',e=>{const b=e.target.closest('.btn');if(!b)ret
 // cart: drawer + ajax add
 const cc=$('#cartCount');
 function setCount(n){cc.textContent=n;cc.classList.remove('bump');void cc.offsetWidth;cc.classList.add('bump')}
-async function loadDrawer(){const d=await (await fetch('/api/cart')).json();$('#drawerBody').innerHTML=d.items.length?d.items.map(i=>`<div class="d-item">${i.image?`<img src="${i.image}" alt="">`:'<div class="ph">S</div>'}<div><a href="${i.url}"><b></b></a><small>${i.qty} × ${money(i.price)}</small></div><b>${money(i.line)}</b></div>`).join(''):'<p class="muted" style="text-align:center;padding:40px 0">Your bag is empty ✦</p>';
+async function loadDrawer(){const d=await (await fetch('/api/cart')).json();$('#drawerBody').innerHTML=d.items.length?d.items.map(i=>`<div class="d-item">${i.image?`<img src="${i.image}" alt="">`:'<div class="ph">S</div>'}<div><a href="${i.url}"><b></b></a><small>${i.variant?esc(i.variant)+' · ':''}${i.qty} × ${money(i.price)}</small></div><b>${money(i.line)}</b></div>`).join(''):'<p class="muted" style="text-align:center;padding:40px 0">Your bag is empty ✦</p>';
  $$('#drawerBody .d-item a b').forEach((el,k)=>el.textContent=d.items[k].name);$('#drawerTotal').textContent=money(d.total);setCount0(d.count)}
 function setCount0(n){cc.textContent=n}
 const openD=()=>{document.body.classList.add('drawer-open');loadDrawer()},closeD=()=>document.body.classList.remove('drawer-open');
 $('#cartBtn').addEventListener('click',e=>{if(location.pathname==='/cart'||location.pathname==='/checkout')return;e.preventDefault();openD()});
 $('#drawerClose').onclick=closeD;$('#drawerBg').onclick=closeD;addEventListener('keydown',e=>e.key==='Escape'&&closeD());
 document.addEventListener('submit',async e=>{const f=e.target.closest('.ajax-add');if(!f)return;if(e.submitter&&e.submitter.name==='buy')return;e.preventDefault();const btn=f.querySelector('.add-btn,button.primary'),old=btn.textContent;
- try{const r=await fetch(f.action,{method:'POST',body:new FormData(f),headers:fetchH});const d=await r.json();setCount(d.count);toast('✓ '+d.message);btn.classList.add('added');btn.textContent='Added ✓';setTimeout(()=>{btn.classList.remove('added');btn.textContent=old},1500)}catch(_){f.submit()}});
+ try{const r=await fetch(f.action,{method:'POST',body:new FormData(f),headers:fetchH});const d=await r.json();if(!d.ok){toast('⚠ '+d.message);return}setCount(d.count);toast('✓ '+d.message);btn.classList.add('added');btn.textContent='Added ✓';setTimeout(()=>{btn.classList.remove('added');btn.textContent=old},1500)}catch(_){f.submit()}});
 // steppers (+ auto-update on cart page)
 document.addEventListener('click',e=>{const b=e.target.closest('.stepper button');if(!b)return;const i=$('input',b.parentElement),min=+i.min||0,max=+i.max||99;i.value=Math.max(min,Math.min(max,(+i.value||0)+ +b.dataset.step));const cf=$('#cartForm');if(cf){clearTimeout(cf._t);cf._t=setTimeout(()=>cf.submit(),700)}});
 // shop: instant search + sort
@@ -108,4 +108,12 @@ if(inp&&prev){const cloud=inp.dataset.cloudName?{n:inp.dataset.cloudName,p:inp.d
   fresh.forEach(f=>{if(items.length<12){const it={file:f,src:URL.createObjectURL(f),pct:0,kind:isVid(f)?'video':'image'};items.push(it);if(cloud)upload(it)}});
   if(cloud)inp.value='';else syncLocal();render()});
  const form=inp.closest('form');if(form)form.addEventListener('submit',e=>{if(!cloud)return;if(items.some(i=>!i.url&&!i.err)){e.preventDefault();alert('Please wait until the uploads finish.')}else if(items.some(i=>i.err)){e.preventDefault();alert('Remove the files that failed to upload, then try again.')}})}
+
+// product options: chosen text + friendly "please select" message; admin colour/size editor
+$$('.opt-group').forEach(g=>g.addEventListener('change',e=>{if(e.target.type!=='radio')return;const c=$('.opt-chosen',g);if(c)c.textContent=e.target.value;g.classList.remove('missing');const m=$('.opt-msg',g);if(m)m.hidden=true}));
+document.addEventListener('invalid',e=>{const r=e.target,g=r.type==='radio'&&r.closest('.opt-group');if(!g)return;e.preventDefault();g.classList.remove('shake');void g.offsetWidth;g.classList.add('missing','shake');const m=$('.opt-msg',g);if(m)m.hidden=false;g.scrollIntoView({block:'center',behavior:'smooth'})},true);
+$$('.opt-editor').forEach(ed=>{const inp=$('[data-opt-input]',ed),pv=$('[data-opt-preview]',ed),list=()=>inp.value.split(/[,\n]+/).map(s=>s.trim()).filter(Boolean);
+ const draw=()=>{pv.innerHTML='';const l=list();l.forEach(v=>{const c=document.createElement('span');c.className='chip-pill';c.textContent=v;pv.append(c)});$$('[data-preset]',ed).forEach(b=>b.classList.toggle('on',l.some(x=>x.toLowerCase()===b.dataset.preset.toLowerCase())))};
+ $$('[data-preset]',ed).forEach(b=>b.addEventListener('click',()=>{const v=b.dataset.preset,l=list(),k=l.findIndex(x=>x.toLowerCase()===v.toLowerCase());if(k>=0)l.splice(k,1);else l.push(v);inp.value=l.join(', ');draw()}));
+ inp.addEventListener('input',draw);draw()});
 })();

@@ -170,15 +170,20 @@ SCHEMA = """
         CREATE TABLE IF NOT EXISTS chat_files(name TEXT PRIMARY KEY, mime TEXT NOT NULL DEFAULT 'image/jpeg', data BLOB NOT NULL);
         """
 
-ORDER_COLUMNS = {
-    "payment_method": "TEXT DEFAULT 'Cash on Delivery'", "payment_status": "TEXT DEFAULT 'Unpaid'", "payment_reference": "TEXT DEFAULT ''",
-    "address_confirmed": "INTEGER DEFAULT 0", "chat_state": "TEXT DEFAULT 'done'", "payment_screenshot": "TEXT DEFAULT ''",
-    "customer_unread": "INTEGER DEFAULT 0", "agent_unread": "INTEGER DEFAULT 0",
+TABLE_COLUMNS = {
+    "orders": {
+        "payment_method": "TEXT DEFAULT 'Cash on Delivery'", "payment_status": "TEXT DEFAULT 'Unpaid'", "payment_reference": "TEXT DEFAULT ''",
+        "address_confirmed": "INTEGER DEFAULT 0", "chat_state": "TEXT DEFAULT 'done'", "payment_screenshot": "TEXT DEFAULT ''",
+        "customer_unread": "INTEGER DEFAULT 0", "agent_unread": "INTEGER DEFAULT 0",
+    },
+    "products": {"colors": "TEXT DEFAULT ''", "sizes": "TEXT DEFAULT ''"},
+    "order_items": {"color": "TEXT DEFAULT ''", "size": "TEXT DEFAULT ''"},
 }
 
 def schema_ready(c):
     try:
         c.execute("SELECT agent_unread FROM orders LIMIT 1"); c.execute("SELECT 1 FROM chat_files LIMIT 1"); c.execute("SELECT 1 FROM product_media LIMIT 1")
+        c.execute("SELECT colors, sizes FROM products LIMIT 1"); c.execute("SELECT color, size FROM order_items LIMIT 1")
         return bool(c.execute("SELECT id FROM users WHERE role='admin'").fetchone())
     except Exception:
         return False
@@ -189,13 +194,14 @@ def init_db():
     try:
         if schema_ready(c): return False
         c.executescript(SCHEMA)
-        if USE_PG:
-            for column, definition in ORDER_COLUMNS.items():
-                c.execute(f"ALTER TABLE orders ADD COLUMN IF NOT EXISTS {column} {definition}")
-        else:
-            have = {row[1] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
-            for column, definition in ORDER_COLUMNS.items():
-                if column not in have: c.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
+        for table, columns in TABLE_COLUMNS.items():
+            if USE_PG:
+                for column, definition in columns.items():
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+            else:
+                have = {row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+                for column, definition in columns.items():
+                    if column not in have: c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         admin_email = os.environ.get("ADMIN_EMAIL", "admin@starkstore.local")
         admin_password = os.environ.get("ADMIN_PASSWORD") or (None if ON_VERCEL else "ChangeMe123!")
         exists = c.execute("SELECT id FROM users WHERE role='admin'").fetchone()
@@ -232,6 +238,29 @@ def ensure_ready():
             app.logger.exception("database init failed")
             return ("Database is not ready: " + str(e)[:200], 503)
 
+COLOR_HEX = {"red": "#dc2626", "black": "#111827", "white": "#ffffff", "offwhite": "#f5f1e6", "ivory": "#f8f4e3", "blue": "#2563eb", "navy": "#1e3a8a",
+    "navyblue": "#1e3a8a", "skyblue": "#38bdf8", "green": "#16a34a", "olive": "#6b7a2a", "mint": "#86efac", "yellow": "#facc15", "mustard": "#d4a017",
+    "lemon": "#fde047", "pink": "#ec4899", "hotpink": "#ff4fa3", "peach": "#fdba94", "coral": "#fb7185", "orange": "#f97316", "purple": "#9333ea",
+    "lavender": "#c4b5fd", "violet": "#7c3aed", "maroon": "#7f1d1d", "burgundy": "#7f1d3a", "wine": "#6d1a36", "brown": "#7c4a2d", "chocolate": "#4b2e1f",
+    "coffee": "#6f4e37", "beige": "#e7d3b0", "cream": "#fff3d6", "khaki": "#bda76a", "camel": "#c19a6b", "grey": "#6b7280", "gray": "#6b7280",
+    "charcoal": "#374151", "silver": "#c0c0c0", "gold": "#d4af37", "teal": "#0d9488", "turquoise": "#14b8a6", "rust": "#b7410e", "firozi": "#14b8a6"}
+
+def clean_options(raw):
+    """'Red, black ,Red' -> 'Red,black'  (colours / sizes the admin typed)."""
+    out, seen = [], set()
+    for part in re.split(r"[,\n|]+", raw or ""):
+        v = re.sub(r"\s+", " ", re.sub(r"[^\w\s\-/.&+()']", "", part)).strip()[:24]
+        if v and v.lower() not in seen: seen.add(v.lower()); out.append(v)
+    return ",".join(out[:15])
+
+def opts(raw): return [x for x in (raw or "").split(",") if x]
+
+def color_hex(name):
+    words = re.findall(r"[a-z]+", (name or "").lower())
+    for cand in ["".join(words)] + words[::-1]:
+        if cand in COLOR_HEX: return COLOR_HEX[cand]
+    return ""
+
 def media_src(name, w=1200):
     """Public URL of a product image/video. Cloudinary images are resized (w = max width) and optimised."""
     if not name: return ""
@@ -262,7 +291,7 @@ def asset(filename):
     """Static file URL with a version, so browsers can cache it for a long time."""
     return url_for("static", filename=filename, v=ASSET_V)
 
-app.jinja_env.globals.update(media_src=media_src, media_poster=media_poster, asset=asset)
+app.jinja_env.globals.update(media_src=media_src, media_poster=media_poster, asset=asset, opts=opts, color_hex=color_hex)
 
 def admin_required(fn):
     @wraps(fn)
@@ -487,15 +516,32 @@ def product_detail(pid):
     reviews = db().execute("SELECT * FROM reviews WHERE product_id=? AND approved=1 ORDER BY id DESC", (pid,)).fetchall()
     return render_template("product.html", p=p, reviews=reviews, media=product_media(pid, p["image"]))
 
+def cart_key(pid, color="", size=""): return f"{pid}|{color}|{size}"
+
+def parse_key(key):
+    parts = (str(key).split("|") + ["", ""])[:3]
+    return parts[0], parts[1], parts[2]
+
+def variant_label(color, size): return ", ".join(x for x in (color, size) if x)
+
+def get_cart():
+    """Cart as {key: qty}; key = 'productId|colour|size' (older carts without options are upgraded)."""
+    return {(k if "|" in k else k + "||"): int(v) for k, v in session.get("cart", {}).items()}
+
+def cart_lines():
+    lines = []
+    for key, qty in get_cart().items():
+        pid, color, size = parse_key(key)
+        p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
+        if p: lines.append({"key": key, "p": p, "color": color, "size": size, "variant": variant_label(color, size), "qty": qty})
+    return lines
+
 def cart_snapshot():
     items, total = [], 0
-    for pid, qty in session.get("cart", {}).items():
-        p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
-        if p:
-            price = product_price(p); total += price * qty
-            items.append({"id": p["id"], "name": p["name"], "qty": qty, "price": price, "line": round(price * qty, 2),
-                          "image": url_for("static", filename="uploads/" + p["image"]) if p["image"] else "",
-                          "url": url_for("product_detail", pid=p["id"])})
+    for l in cart_lines():
+        p = l["p"]; price = product_price(p); total += price * l["qty"]
+        items.append({"id": p["id"], "key": l["key"], "name": p["name"], "variant": l["variant"], "qty": l["qty"], "price": price, "line": round(price * l["qty"], 2),
+                      "image": media_src(p["image"], 160) if p["image"] else "", "url": url_for("product_detail", pid=p["id"])})
     return {"items": items, "total": round(total, 2), "count": sum(i["qty"] for i in items)}
 
 @app.get("/api/cart")
@@ -504,39 +550,53 @@ def api_cart():
 
 @app.route("/cart")
 def cart():
-    ids = session.get("cart", {})
     items, total = [], 0
-    for pid, qty in ids.items():
-        p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
-        if p:
-            price = product_price(p); line = price * qty; total += line
-            items.append({"product": p, "qty": qty, "price": price, "line": line})
+    for l in cart_lines():
+        price = product_price(l["p"]); line = price * l["qty"]; total += line
+        items.append({"key": l["key"], "product": l["p"], "variant": l["variant"], "qty": l["qty"], "price": price, "line": line})
     return render_template("cart.html", items=items, total=round(total,2))
 
 @app.post("/cart/add/<int:pid>")
 def add_cart(pid):
     p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
     if not p: abort(404)
-    cart = session.get("cart", {})
-    key = str(pid); cart[key] = min(int(cart.get(key, 0)) + max(1, int(request.form.get("quantity", 1))), max(1, p["stock"]))
+    colors, sizes = opts(p["colors"]), opts(p["sizes"])
+    color = request.form.get("color", "").strip() if colors else ""
+    size = request.form.get("size", "").strip() if sizes else ""
+    err = "Please select a colour." if colors and color not in colors else "Please select a size." if sizes and size not in sizes else ""
+    wants_json = request.headers.get("X-Requested-With") == "fetch"
+    cart = get_cart(); key = cart_key(pid, color, size)
+    room = max(0, p["stock"] - sum(q for k, q in cart.items() if k != key and parse_key(k)[0] == str(pid)))
+    if not err and room <= 0: err = "Sorry, this item is out of stock."
+    if err:
+        if wants_json: return jsonify(ok=False, message=err), 400
+        flash(err, "error"); return redirect(url_for("product_detail", pid=pid))
+    try: add = max(1, int(request.form.get("quantity", 1)))
+    except ValueError: add = 1
+    cart[key] = min(cart.get(key, 0) + add, room)
     session["cart"] = cart
     if request.form.get("buy"):
         return redirect(url_for("checkout"))
-    if request.headers.get("X-Requested-With") == "fetch":
-        return jsonify(ok=True, message=p["name"] + " added to your bag", **cart_snapshot())
+    if wants_json:
+        label = variant_label(color, size)
+        return jsonify(ok=True, message=p["name"] + (f" ({label})" if label else "") + " added to your bag", **cart_snapshot())
     flash("Added to your cart.", "success")
     return redirect(request.referrer or url_for("shop"))
 
 @app.post("/cart/update")
 def update_cart():
-    cart = session.get("cart", {})
-    for key, value in request.form.items():
-        if key.startswith("qty_"):
-            pid = key[4:]
-            try: qty = max(0, min(99, int(value)))
-            except ValueError: qty = 1
-            if qty == 0: cart.pop(pid, None)
-            else: cart[pid] = qty
+    cart = get_cart()
+    for field, value in request.form.items():
+        if not field.startswith("qty_"): continue
+        key = field[4:]
+        if key not in cart: continue
+        try: qty = max(0, min(99, int(value)))
+        except ValueError: qty = 1
+        if qty == 0: cart.pop(key, None); continue
+        pid = parse_key(key)[0]
+        p = db().execute("SELECT stock FROM products WHERE id=?", (pid,)).fetchone()
+        if p: qty = min(qty, max(1, p["stock"] - sum(q for k, q in cart.items() if k != key and parse_key(k)[0] == pid)))
+        cart[key] = qty
     session["cart"] = cart
     if request.headers.get("X-Requested-With") == "fetch":
         return jsonify(ok=True, **cart_snapshot())
@@ -544,8 +604,7 @@ def update_cart():
 
 @app.route("/checkout", methods=["GET", "POST"])
 def checkout():
-    cart = session.get("cart", {})
-    if not cart: return redirect(url_for("shop"))
+    if not get_cart(): return redirect(url_for("shop"))
     st = get_settings()
     methods = [m for m in PAY_METHODS if st.get("pay_" + m[0]) == "1"] or [PAY_METHODS[0]]
     if request.method == "POST":
@@ -555,13 +614,14 @@ def checkout():
         if not all([name, email, phone, address]) or method not in {m[0] for m in methods}:
             flash("Please complete all checkout fields and choose a valid payment method.", "error")
             return redirect(url_for("checkout"))
+        lines = cart_lines(); need = {}
+        for l in lines: need[l["p"]["id"]] = need.get(l["p"]["id"], 0) + l["qty"]
+        if len(lines) != len(get_cart()) or any(need[l["p"]["id"]] > l["p"]["stock"] for l in lines):
+            flash("A product is unavailable or has insufficient stock. Please update your cart.", "error")
+            return redirect(url_for("cart"))
         items, total = [], 0
-        for pid, qty in cart.items():
-            p = db().execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
-            if not p or p["stock"] < qty:
-                flash("A product is unavailable or has insufficient stock. Please update your cart.", "error")
-                return redirect(url_for("cart"))
-            price = product_price(p); total += price * qty; items.append((p, qty, price))
+        for l in lines:
+            price = product_price(l["p"]); total += price * l["qty"]; items.append((l["p"], l["qty"], price, l["color"], l["size"]))
         method_label = dict((m[0], m[1]) for m in PAY_METHODS)[method]
         payment_status = "Unpaid" if method == "cod" else "Awaiting payment"
         conn = db()
@@ -569,10 +629,10 @@ def checkout():
                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                            (session.get("user_id"), name, email, phone, address, round(total, 2), "Pending", now(), method_label, payment_status, "", "await_address", 1))
         oid = cur.lastrowid
-        for p, qty, price in items:
-            conn.execute("INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price) VALUES(?,?,?,?,?)", (oid, p["id"], p["name"], qty, price))
+        for p, qty, price, color, size in items:
+            conn.execute("INSERT INTO order_items(order_id,product_id,product_name,quantity,unit_price,color,size) VALUES(?,?,?,?,?,?,?)", (oid, p["id"], p["name"], qty, price, color, size))
             conn.execute("UPDATE products SET stock=stock-? WHERE id=?", (qty, p["id"]))
-        start_chat(conn, oid, name, phone, address, round(total, 2), method_label, [(p["name"], q, pr) for p, q, pr in items])
+        start_chat(conn, oid, name, phone, address, round(total, 2), method_label, [(p["name"] + (f" ({variant_label(c, z)})" if c or z else ""), q, pr) for p, q, pr, c, z in items])
         conn.commit(); session["cart"] = {}
         ids = session.get("my_orders", []); ids.append(oid); session["my_orders"] = ids[-50:]
         return redirect(url_for("order_chat", oid=oid, new=1))
@@ -588,8 +648,8 @@ def my_orders():
     rows = []
     if conds:
         for o in db().execute("SELECT * FROM orders WHERE " + " OR ".join(conds) + " ORDER BY id DESC", args).fetchall():
-            its = db().execute("SELECT product_name,quantity FROM order_items WHERE order_id=?", (o["id"],)).fetchall()
-            rows.append({"o": o, "items": ", ".join(f"{i['product_name']} ×{i['quantity']}" for i in its)})
+            its = db().execute("SELECT product_name,quantity,color,size FROM order_items WHERE order_id=?", (o["id"],)).fetchall()
+            rows.append({"o": o, "items": ", ".join(f"{i['product_name']}{' (' + variant_label(i['color'], i['size']) + ')' if i['color'] or i['size'] else ''} ×{i['quantity']}" for i in its)})
     return render_template("orders.html", rows=rows)
 
 @app.get("/orders/<int:oid>")
@@ -751,10 +811,11 @@ def admin_products():
         try:
             media=cloud_media_from_form()+save_media_files(request.files.getlist("media"))
             image=next((n for n,k in media if k=="image"),"")
-            cur=db().execute("INSERT INTO products(name,category,description,price,discount,stock,image,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            cur=db().execute("INSERT INTO products(name,category,description,price,discount,stock,image,created_at,colors,sizes) VALUES(?,?,?,?,?,?,?,?,?,?)",
               (request.form["name"].strip(),request.form.get("category","General").strip(),request.form.get("description","").strip(),
                *parse_prices(request.form),
-               max(0,int(request.form.get("stock",0))),image,datetime.now().isoformat(timespec="seconds")))
+               max(0,int(request.form.get("stock",0))),image,datetime.now().isoformat(timespec="seconds"),
+               clean_options(request.form.get("colors")),clean_options(request.form.get("sizes"))))
             for n,k in media: db().execute("INSERT INTO product_media(product_id,filename,kind) VALUES(?,?,?)",(cur.lastrowid,n,k))
             db().commit(); flash("Product published.", "success")
         except MediaError as e: flash(str(e), "error")
@@ -773,10 +834,11 @@ def edit_product(pid):
             media=cloud_media_from_form()+save_media_files(request.files.getlist("media"))
             image=p["image"] or next((n for n,k in media if k=="image"),"")
             for n,k in media: db().execute("INSERT INTO product_media(product_id,filename,kind) VALUES(?,?,?)",(pid,n,k))
-            db().execute("UPDATE products SET name=?,category=?,description=?,price=?,discount=?,stock=?,image=?,active=? WHERE id=?",
+            db().execute("UPDATE products SET name=?,category=?,description=?,price=?,discount=?,stock=?,image=?,active=?,colors=?,sizes=? WHERE id=?",
               (request.form["name"].strip(),request.form.get("category","General").strip(),request.form.get("description","").strip(),
                *parse_prices(request.form),
-               max(0,int(request.form.get("stock",0))),image,1 if request.form.get("active") else 0,pid))
+               max(0,int(request.form.get("stock",0))),image,1 if request.form.get("active") else 0,
+               clean_options(request.form.get("colors")),clean_options(request.form.get("sizes")),pid))
             db().commit(); flash("Product updated.", "success"); return redirect(url_for("admin_products"))
         except MediaError as e: flash(str(e), "error")
         except (ValueError,KeyError): flash("Please check the details: sale price must not be higher than the original price.", "error")

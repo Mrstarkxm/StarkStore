@@ -103,3 +103,10 @@ Notes
 - CSS and JS are combined into `public/static/site.css` and `site.js`. **After editing `style.css`, `upgrade.css`, `stark.css`, `app.js` or `stark.js`, run `python build_assets.py`** and commit the new `site.*` files.
 - Static files are cached for a year (`vercel.json`); URLs carry a version so updates still reach visitors.
 - Cloudinary pictures are requested at the size needed (small for cards, larger on the product page); video thumbnails use a still image.
+
+## Colour & size options, product description
+- Admin → Products (add / edit): fill **Colours** and/or **Sizes** (comma separated, or tap the quick buttons). Leave empty for products without options.
+- The customer must pick a colour/size on the product page before *Add to bag* or *Buy now*; cards of such products show **Choose options**. The choice is kept in the bag, checkout, order chat, order history and the admin order page. Each colour/size combination is its own bag line.
+- Stock is still counted per product (not per colour/size).
+- The product description now has its own **Product Description** section below the photos and details (line breaks are kept).
+- Existing databases are updated automatically on the next start.
