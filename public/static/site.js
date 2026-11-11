@@ -159,26 +159,32 @@ const g=$('#gallery');if(g){const stage=$('#stage'),th=$$('.thumb',g),cnt=$('#gC
   if(t.dataset.kind==='video'){const v=document.createElement('video');v.src=t.dataset.src;v.controls=true;v.playsInline=true;v.preload='metadata';if(t.dataset.poster)v.poster=t.dataset.poster;stage.append(v);stage.classList.add('is-video')}
   else{const im=document.createElement('img');im.src=t.dataset.src;im.alt='';stage.append(im);stage.classList.remove('is-video')}
   th.forEach((x,k)=>x.classList.toggle('on',k===i));t.scrollIntoView({block:'nearest',inline:'center',behavior:'smooth'});if(cnt)cnt.textContent=(i+1)+' / '+th.length}
- th.forEach((t,k)=>t.onclick=()=>show(k));$('.g-nav.prev',g)?.addEventListener('click',()=>show(i-1));$('.g-nav.next',g)?.addEventListener('click',()=>show(i+1));
+ const radios=$$('input[name=color]');function pickColor(n){const r=radios.find(x=>x.value===n);if(r&&!r.checked){r.checked=true;r.dispatchEvent(new Event('change',{bubbles:true}))}}
+ radios.forEach(r=>r.addEventListener('change',()=>{if(th[i]&&th[i].dataset.color===r.value)return;const k=th.findIndex(x=>x.dataset.color===r.value);if(k>=0)show(k)}));
+ th.forEach((t,k)=>t.onclick=()=>{show(k);if(t.dataset.color)pickColor(t.dataset.color)});$('.g-nav.prev',g)?.addEventListener('click',()=>show(i-1));$('.g-nav.next',g)?.addEventListener('click',()=>show(i+1));
  addEventListener('keydown',e=>{if(/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName))return;if(e.key==='ArrowLeft')show(i-1);if(e.key==='ArrowRight')show(i+1)});
  let sx=null;stage.addEventListener('touchstart',e=>sx=e.touches[0].clientX,{passive:true});stage.addEventListener('touchend',e=>{if(sx===null)return;const d=e.changedTouches[0].clientX-sx;if(Math.abs(d)>50)show(i+(d<0?1:-1));sx=null})}
 const inp=$('[data-media-input]'),prev=$('[data-media-preview]');
-if(inp&&prev){const cloud=inp.dataset.cloudName?{n:inp.dataset.cloudName,p:inp.dataset.cloudPreset}:null,hid=$('#mediaUrls');let items=[];
+if(inp&&prev){const cloud=inp.dataset.cloudName?{n:inp.dataset.cloudName,p:inp.dataset.cloudPreset}:null,hid=$('#mediaUrls'),hidc=$('#mediaColors'),form=inp.closest('form'),colorsInp=form?form.elements.colors:null;let items=[];
  const isVid=f=>f.type.startsWith('video'),ok=f=>(f.type.startsWith('image/')&&f.size<=8*1048576)||(isVid(f)&&f.size<=100*1048576);
- const out=()=>{if(hid)hid.value=JSON.stringify(items.filter(i=>i.url).map(i=>({url:i.url,kind:i.kind})))};
+ const colorList=()=>colorsInp?colorsInp.value.split(/[,\n]+/).map(s=>s.trim()).filter(Boolean):[];
+ const out=()=>{if(hid)hid.value=JSON.stringify(items.filter(i=>i.url).map(i=>({url:i.url,kind:i.kind,color:i.color||''})));if(hidc)hidc.value=JSON.stringify(items.map(i=>i.color||''))};
+ const label=it=>(isVid(it.file)?'🎬 ':'🖼 ')+it.file.name+(it.err?' — '+it.err:it.url?' ✓':cloud?' — '+it.pct+'%':'');
  function syncLocal(){if(cloud)return;const dt=new DataTransfer();items.forEach(i=>dt.items.add(i.file));inp.files=dt.files}
  function render(){prev.innerHTML='';items.forEach((it,k)=>{const d=document.createElement('div');d.className='mp-item';const m=isVid(it.file)?document.createElement('video'):document.createElement('img');m.src=it.src;if(m.tagName==='VIDEO'){m.muted=true;m.preload='metadata'}
-  const x=document.createElement('button');x.type='button';x.className='x';x.textContent='×';x.onclick=()=>{if(it.xhr)it.xhr.abort();items.splice(k,1);out();syncLocal();render()};
-  const n=document.createElement('span');n.className='name';n.textContent=(isVid(it.file)?'🎬 ':'🖼 ')+it.file.name+(it.err?' — '+it.err:it.url?' ✓':cloud?' — '+it.pct+'%':'');d.append(m,x,n);
-  if(cloud&&!it.url&&!it.err){const b=document.createElement('i');b.className='bar';b.style.width=it.pct+'%';d.append(b)}prev.append(d)})}
+  const x=document.createElement('button');x.type='button';x.className='x';x.textContent='×';x.onclick=()=>{if(it.xhr)it.xhr.abort();items.splice(k,1);syncLocal();render()};
+  const n=document.createElement('span');n.className='name';n.textContent=label(it);it.nameEl=n;d.append(m,x,n);
+  if(!isVid(it.file)){const sel=document.createElement('select');sel.className='mp-color';sel.title='Which colour is this picture?';sel.add(new Option('No colour',''));colorList().forEach(c=>sel.add(new Option(c,c)));sel.value=it.color||'';if(sel.value!==(it.color||''))it.color='';sel.onchange=()=>{it.color=sel.value;out()};d.append(sel)}
+  if(cloud&&!it.url&&!it.err){const b=document.createElement('i');b.className='bar';b.style.width=it.pct+'%';it.bar=b;d.append(b)}prev.append(d)});out()}
  function upload(it){const fd=new FormData();fd.append('file',it.file);fd.append('upload_preset',cloud.p);const x=new XMLHttpRequest();it.xhr=x;x.open('POST','https://api.cloudinary.com/v1_1/'+cloud.n+'/auto/upload');
-  x.upload.onprogress=e=>{if(e.lengthComputable){it.pct=Math.round(e.loaded/e.total*100);render()}};
-  x.onload=()=>{try{const r=JSON.parse(x.responseText);if(x.status<300&&r.secure_url){it.url=r.secure_url;it.kind=r.resource_type==='video'?'video':'image'}else it.err=(r.error&&r.error.message)||'Upload failed'}catch(e){it.err='Upload failed'}it.xhr=null;out();render()};
+  x.upload.onprogress=e=>{if(e.lengthComputable){it.pct=Math.round(e.loaded/e.total*100);if(it.bar)it.bar.style.width=it.pct+'%';if(it.nameEl)it.nameEl.textContent=label(it)}};
+  x.onload=()=>{try{const r=JSON.parse(x.responseText);if(x.status<300&&r.secure_url){it.url=r.secure_url;it.kind=r.resource_type==='video'?'video':'image'}else it.err=(r.error&&r.error.message)||'Upload failed'}catch(e){it.err='Upload failed'}it.xhr=null;render()};
   x.onerror=()=>{it.err='Network error';it.xhr=null;render()};x.send(fd)}
  inp.addEventListener('change',()=>{const all=[...inp.files],fresh=all.filter(ok);if(fresh.length<all.length)alert('Some files were skipped (images up to 8 MB, videos up to 100 MB).');
-  fresh.forEach(f=>{if(items.length<12){const it={file:f,src:URL.createObjectURL(f),pct:0,kind:isVid(f)?'video':'image'};items.push(it);if(cloud)upload(it)}});
+  fresh.forEach(f=>{if(items.length<12){const it={file:f,src:URL.createObjectURL(f),pct:0,kind:isVid(f)?'video':'image',color:''};items.push(it);if(cloud)upload(it)}});
   if(cloud)inp.value='';else syncLocal();render()});
- const form=inp.closest('form');if(form)form.addEventListener('submit',e=>{if(!cloud)return;if(items.some(i=>!i.url&&!i.err)){e.preventDefault();alert('Please wait until the uploads finish.')}else if(items.some(i=>i.err)){e.preventDefault();alert('Remove the files that failed to upload, then try again.')}})}
+ if(colorsInp)colorsInp.addEventListener('input',()=>{if(items.length)render()});
+ if(form)form.addEventListener('submit',e=>{if(!cloud)return;if(items.some(i=>!i.url&&!i.err)){e.preventDefault();alert('Please wait until the uploads finish.')}else if(items.some(i=>i.err)){e.preventDefault();alert('Remove the files that failed to upload, then try again.')}})}
 
 // product options: chosen text + friendly "please select" message; admin colour/size editor
 $$('.opt-group').forEach(g=>g.addEventListener('change',e=>{if(e.target.type!=='radio')return;const c=$('.opt-chosen',g);if(c)c.textContent=e.target.value;g.classList.remove('missing');const m=$('.opt-msg',g);if(m)m.hidden=true}));

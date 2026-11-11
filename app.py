@@ -178,12 +178,13 @@ TABLE_COLUMNS = {
     },
     "products": {"colors": "TEXT DEFAULT ''", "sizes": "TEXT DEFAULT ''"},
     "order_items": {"color": "TEXT DEFAULT ''", "size": "TEXT DEFAULT ''"},
+    "product_media": {"color": "TEXT DEFAULT ''"},
 }
 
 def schema_ready(c):
     try:
         c.execute("SELECT agent_unread FROM orders LIMIT 1"); c.execute("SELECT 1 FROM chat_files LIMIT 1"); c.execute("SELECT 1 FROM product_media LIMIT 1")
-        c.execute("SELECT colors, sizes FROM products LIMIT 1"); c.execute("SELECT color, size FROM order_items LIMIT 1")
+        c.execute("SELECT colors, sizes FROM products LIMIT 1"); c.execute("SELECT color, size FROM order_items LIMIT 1"); c.execute("SELECT color FROM product_media LIMIT 1")
         return bool(c.execute("SELECT id FROM users WHERE role='admin'").fetchone())
     except Exception:
         return False
@@ -536,12 +537,19 @@ def cart_lines():
         if p: lines.append({"key": key, "p": p, "color": color, "size": size, "variant": variant_label(color, size), "qty": qty})
     return lines
 
+def variant_image(p, color):
+    """Picture of the chosen colour (falls back to the product's cover picture)."""
+    if color:
+        r = db().execute("SELECT filename FROM product_media WHERE product_id=? AND color=? AND kind='image' ORDER BY id LIMIT 1", (p["id"], color)).fetchone()
+        if r: return r["filename"]
+    return p["image"]
+
 def cart_snapshot():
     items, total = [], 0
     for l in cart_lines():
         p = l["p"]; price = product_price(p); total += price * l["qty"]
         items.append({"id": p["id"], "key": l["key"], "name": p["name"], "variant": l["variant"], "qty": l["qty"], "price": price, "line": round(price * l["qty"], 2),
-                      "image": media_src(p["image"], 160) if p["image"] else "", "url": url_for("product_detail", pid=p["id"])})
+                      "image": media_src(variant_image(p, l["color"]), 160) if variant_image(p, l["color"]) else "", "url": url_for("product_detail", pid=p["id"])})
     return {"items": items, "total": round(total, 2), "count": sum(i["qty"] for i in items)}
 
 @app.get("/api/cart")
@@ -553,7 +561,7 @@ def cart():
     items, total = [], 0
     for l in cart_lines():
         price = product_price(l["p"]); line = price * l["qty"]; total += line
-        items.append({"key": l["key"], "product": l["p"], "variant": l["variant"], "qty": l["qty"], "price": price, "line": line})
+        items.append({"key": l["key"], "product": l["p"], "image": variant_image(l["p"], l["color"]), "variant": l["variant"], "qty": l["qty"], "price": price, "line": line})
     return render_template("cart.html", items=items, total=round(total,2))
 
 @app.post("/cart/add/<int:pid>")
@@ -784,19 +792,30 @@ def cloud_media_from_form():
     for it in (items if isinstance(items, list) else [])[:12]:
         url = str(it.get("url", "")) if isinstance(it, dict) else ""
         if not CLOUD_NAME or not url.startswith(prefix): raise MediaError("Invalid media URL.")
-        out.append((url, "video" if "/video/upload/" in url else "image"))
+        out.append((url, "video" if "/video/upload/" in url else "image", str(it.get("color", ""))))
     return out
 
-def save_media_files(files):
+def media_colors_from_form():
+    """Colour chosen for each uploaded file (same order as the files)."""
+    try: v = json.loads(request.form.get("media_colors", "") or "[]")
+    except ValueError: return []
+    return [str(x) for x in v] if isinstance(v, list) else []
+
+def with_colors(items, colors_csv):
+    """Keep a colour only for images, and only if it is one of the product's colours."""
+    allowed = {c.lower(): c for c in opts(colors_csv)}
+    return [(n, k, allowed.get((c or "").strip().lower(), "") if k == "image" else "") for n, k, c in items]
+
+def save_media_files(files, colors=None):
     if ON_VERCEL and any(f and f.filename for f in files):
         raise MediaError("On Vercel, product images and videos are uploaded through Cloudinary (see the README setup).")
     out = []
     try:
-        for f in files[:12]:
+        for i, f in enumerate(files[:12]):
             r = save_media(f)
-            if r: out.append(r)
+            if r: out.append((r[0], r[1], colors[i] if colors and i < len(colors) else ""))
     except ValueError:
-        for n, _ in out: drop_file(n)
+        for n, *_ in out: drop_file(n)
         raise
     return out
 
@@ -809,14 +828,15 @@ def product_media(pid, cover=""):
 def admin_products():
     if request.method=="POST":
         try:
-            media=cloud_media_from_form()+save_media_files(request.files.getlist("media"))
-            image=next((n for n,k in media if k=="image"),"")
+            colors_in=clean_options(request.form.get("colors"))
+            media=with_colors(cloud_media_from_form()+save_media_files(request.files.getlist("media"),media_colors_from_form()),colors_in)
+            image=next((n for n,k,c in media if k=="image"),"")
             cur=db().execute("INSERT INTO products(name,category,description,price,discount,stock,image,created_at,colors,sizes) VALUES(?,?,?,?,?,?,?,?,?,?)",
               (request.form["name"].strip(),request.form.get("category","General").strip(),request.form.get("description","").strip(),
                *parse_prices(request.form),
                max(0,int(request.form.get("stock",0))),image,datetime.now().isoformat(timespec="seconds"),
                clean_options(request.form.get("colors")),clean_options(request.form.get("sizes"))))
-            for n,k in media: db().execute("INSERT INTO product_media(product_id,filename,kind) VALUES(?,?,?)",(cur.lastrowid,n,k))
+            for n,k,c in media: db().execute("INSERT INTO product_media(product_id,filename,kind,color) VALUES(?,?,?,?)",(cur.lastrowid,n,k,c))
             db().commit(); flash("Product published.", "success")
         except MediaError as e: flash(str(e), "error")
         except (ValueError,KeyError): flash("Please check the details: sale price must not be higher than the original price, and use JPG/PNG/WEBP images.", "error")
@@ -831,9 +851,10 @@ def edit_product(pid):
     if not p: abort(404)
     if request.method=="POST":
         try:
-            media=cloud_media_from_form()+save_media_files(request.files.getlist("media"))
-            image=p["image"] or next((n for n,k in media if k=="image"),"")
-            for n,k in media: db().execute("INSERT INTO product_media(product_id,filename,kind) VALUES(?,?,?)",(pid,n,k))
+            colors_in=clean_options(request.form.get("colors"))
+            media=with_colors(cloud_media_from_form()+save_media_files(request.files.getlist("media"),media_colors_from_form()),colors_in)
+            image=p["image"] or next((n for n,k,c in media if k=="image"),"")
+            for n,k,c in media: db().execute("INSERT INTO product_media(product_id,filename,kind,color) VALUES(?,?,?,?)",(pid,n,k,c))
             db().execute("UPDATE products SET name=?,category=?,description=?,price=?,discount=?,stock=?,image=?,active=?,colors=?,sizes=? WHERE id=?",
               (request.form["name"].strip(),request.form.get("category","General").strip(),request.form.get("description","").strip(),
                *parse_prices(request.form),
@@ -862,6 +883,17 @@ def delete_media(pid, mid):
         nxt = db().execute("SELECT filename FROM product_media WHERE product_id=? AND kind='image' ORDER BY id LIMIT 1", (pid,)).fetchone()
         db().execute("UPDATE products SET image=? WHERE id=?", (nxt["filename"] if nxt else "", pid))
     db().commit(); flash("File removed.", "success")
+    return redirect(url_for("edit_product", pid=pid))
+
+@app.post("/admin/products/<int:pid>/media/<int:mid>/color")
+@admin_required
+def media_color(pid, mid):
+    p = db().execute("SELECT colors FROM products WHERE id=?", (pid,)).fetchone()
+    m = db().execute("SELECT * FROM product_media WHERE id=? AND product_id=? AND kind='image'", (mid, pid)).fetchone()
+    if not p or not m: abort(404)
+    allowed = {c.lower(): c for c in opts(p["colors"])}
+    db().execute("UPDATE product_media SET color=? WHERE id=?", (allowed.get(request.form.get("color", "").strip().lower(), ""), mid))
+    db().commit(); flash("Colour saved for this picture.", "success")
     return redirect(url_for("edit_product", pid=pid))
 
 @app.post("/admin/products/<int:pid>/media/<int:mid>/cover")

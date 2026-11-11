@@ -110,3 +110,8 @@ Notes
 - Stock is still counted per product (not per colour/size).
 - The product description now has its own **Product Description** section below the photos and details (line breaks are kept).
 - Existing databases are updated automatically on the next start.
+
+## Pictures linked to colours
+- Admin → Products: after choosing the **Colours** and uploading pictures, a dropdown under each picture lets you say which colour that picture shows. On the edit page every picture also has a colour dropdown.
+- Product page: each colour with a picture shows that dress picture as its swatch. Choosing a colour (or tapping the small picture) selects the colour and shows the matching big picture. The bag and drawer also show the picture of the chosen colour.
+- Colours without a picture still show a coloured dot. Videos cannot be tied to a colour.
