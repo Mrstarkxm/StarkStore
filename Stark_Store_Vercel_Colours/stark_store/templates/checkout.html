@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+{% block title %}Checkout — Stark Store{% endblock %}
+{% block content %}
+<section class="page-heading"><div class="eyebrow">ALMOST YOURS</div><h1>Secure <span class="gradient">checkout.</span></h1><p>Choose the payment option that works best for you.</p></section>
+<section class="section checkout-wrap"><form class="checkout-form" method="post"><aside class="checkout-card summary"><h2>Order summary</h2>{% for i in summary["items"] %}<div class="sum-row"><span>{{i["name"]}}{% if i["variant"] %} <small class="variant">({{i["variant"]}})</small>{% endif %} <small>× {{i["qty"]}}</small></span><b>Rs. {{"%.2f"|format(i["line"])}}</b></div>{% endfor %}<div class="sum-row total"><span>Total</span><b>Rs. {{"%.2f"|format(summary["total"])}}</b></div><p class="checkout-footnote">💬 After you order, our chat assistant will confirm your address and guide your payment.</p>{% if not current_user %}<p class="checkout-footnote">Tip: <a href="{{url_for('login')}}">log in</a> first to keep your order history on every device.</p>{% endif %}</aside>
+  <div class="checkout-card"><h2>Delivery details</h2>
+    <label>Full name<input name="name" required value="{{current_user.name if current_user else ''}}"></label>
+    <label>Email address<input type="email" name="email" required value="{{current_user.email if current_user else ''}}"></label>
+    <label>Phone number<input name="phone" required placeholder="03XX XXXXXXX"></label>
+    <label>Delivery address<textarea name="address" required placeholder="House, street, area, city"></textarea></label>
+  </div>
+  <div class="checkout-card payment-choices"><h2>Payment method</h2>
+    {% for key,label,desc in payment_methods %}
+    <label class="payment-option"><input type="radio" name="payment_method" value="{{key}}" {% if loop.first %}checked{% endif %} onchange="showPaymentFields()">
+      <span class="payment-icon">{% if key=='cod' %}💵{% elif key=='bank' %}🏦{% elif key=='easypaisa' %}📱{% elif key=='jazzcash' %}📲{% else %}💳{% endif %}</span>
+      <span><b>{{label}}</b><small>{{desc}}</small></span></label>
+    {% endfor %}
+    <div id="manualPayment" class="payment-note" hidden>After placing the order, the chat assistant will ask you to confirm your address, then share the account details. You will send a screenshot of your payment in the same chat, and our agent will confirm your order.</div>
+  </div>
+  <button class="btn primary checkout-submit">Place order ↗</button>
+  <p class="checkout-footnote">Orders start as Pending and are confirmed in your order chat.</p>
+</form></section>
+{% endblock %}
+{% block scripts %}<script>
+function showPaymentFields(){
+ const m=document.querySelector('input[name="payment_method"]:checked')?.value;
+ document.getElementById('manualPayment').hidden=(m==='cod');
+ document.querySelectorAll('.payment-option').forEach(o=>o.classList.toggle('selected',o.querySelector('input').checked));
+}
+showPaymentFields();
+</script>{% endblock %}
